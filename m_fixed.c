@@ -69,20 +69,25 @@ FixedDiv
 
 fixed_t
 FixedDiv2
-( fixed_t	a,
-  fixed_t	b )
+( fixed_t	a_,
+  fixed_t	b_ )
 {
 #if 0
-    long long c;
-    c = ((long long)a<<16) / ((long long)b);
-    return (fixed_t) c;
-#endif
+    int a = a_ >> 16, b = a_ & 0xFFFF, c = b_ >> 16, d = b_ & 0xFFFF;
+    if (a < 0) a |= 0xFFFF0000;
+    if (b < 0) b |= 0xFFFF0000;
+    int result_low = (b * d);
+    int result_mid = (a * d) + (b * c);
+    int result_high = (a * c); 
+    return (result_high << 16) + result_mid + (result_low >> 16);
+#else
 
     double c;
 
-    c = ((double)a) / ((double)b) * FRACUNIT;
+    c = ((double)a_) / ((double)b_) * FRACUNIT;
 
     if (c >= 2147483648.0 || c < -2147483648.0)
 	I_Error("FixedDiv: divide by zero");
     return (fixed_t) c;
+#endif
 }

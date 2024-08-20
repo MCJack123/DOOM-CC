@@ -83,3 +83,14 @@ getEvent:
     li a7, 13
     ecall
     ret
+
+/*.globl FixedMul
+FixedMul:
+    mul t0, a0, a1
+    mulh t1, a0, a1
+    srli t0, t0, 16
+    srai a0, t1, 16
+    li t1, 0xFFFF
+    and t0, t0, t1
+    or a0, a0, t0
+    ret*/

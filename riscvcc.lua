@@ -1,42 +1,72 @@
 -- Licensed under GPLv2
-if not ffi then error("Requires FFI library on LuaJIT, enable jit_ffi_enable in config/global.json") end
+--if not ffi then error("Requires FFI library on LuaJIT, enable jit_ffi_enable in config/global.json") end
+local bit32 = bit32
 local RISCV = {reg = {}, pc = 0, syscalls = {}, opcodes = {[0x63] = {}, [0x03] = {}, [0x23] = {}, [0x13] = {}, [0x33] = {}}, mult_opcodes = {}, halt = false}
 for i = 1, 31 do RISCV.reg[i] = 0 end
 setmetatable(RISCV.reg, {__index = function() return 0 end, __newindex = function() end})
-RISCV.mem = ffi.new("uint8_t[?]", 0x2010000)
-RISCV.mem16 = ffi.cast("uint16_t*", RISCV.mem)
-RISCV.mem32 = ffi.cast("uint32_t*", RISCV.mem)
-
-pcall(function()
-local struct_timespec = ffi.cdef([[
-    struct timespec
-    {
-        uint32_t tv_sec;
-        uint32_t tv_nsec;
-        int: 32;
-    };
-]])
-
-local struct_stat = ffi.cdef([[
-    struct stat
-    {
-        uint32_t		st_dev;
-        uint32_t		st_ino;
-        uint32_t	    st_mode;
-        uint32_t	    st_nlink;
-        uint32_t		st_uid;
-        uint32_t		st_gid;
-        uint32_t		st_rdev;
-        int32_t		    st_size;
-        struct timespec st_atim;
-        struct timespec st_mtim;
-        struct timespec st_ctim;
-        int32_t         st_blksize;
-        int32_t	        st_blocks;
-        int32_t		    st_spare4[2];
-    };
-]])
-end)
+local fficopy, ffistring, canDrawFFI
+if ffi then
+    RISCV.mem = ffi.new("uint8_t[?]", 0x2010000)
+    RISCV.mem16 = ffi.cast("uint16_t*", RISCV.mem)
+    RISCV.mem32 = ffi.cast("uint32_t*", RISCV.mem)
+    fficopy, ffistring = ffi.copy, ffi.string
+    canDrawFFI = pcall(term.drawPixels, 0, 0, RISCV.mem, 1, 1)
+else
+    local function __add(self, offset)
+        return setmetatable({}, {
+            __index = function(_, idx) return self[offset+idx] end,
+            __newindex = function(_, idx, val) self[offset+idx] = val end,
+            __add = __add
+        })
+    end
+    RISCV.mem = setmetatable({}, {
+        __index = function() return 0 end,
+        __add = __add
+    })
+    RISCV.mem16 = setmetatable({}, {
+        __index = function(_, idx) return RISCV.mem[idx*2] + RISCV.mem[idx*2+1] * 256 end,
+        __newindex = function(_, idx, val)
+            RISCV.mem[idx*2] = bit32.extract(val, 0, 8)
+            RISCV.mem[idx*2+1] = bit32.extract(val, 8, 8)
+        end,
+        __add = __add
+    })
+    RISCV.mem32 = setmetatable({}, {
+        __index = function(_, idx) return RISCV.mem[idx*4] + RISCV.mem[idx*4+1] * 256 + RISCV.mem[idx*4+2] * 65536 + RISCV.mem[idx*4+3] * 16777216 end,
+        __newindex = function(_, idx, val)
+            RISCV.mem[idx*4] = bit32.extract(val, 0, 8)
+            RISCV.mem[idx*4+1] = bit32.extract(val, 8, 8)
+            RISCV.mem[idx*4+2] = bit32.extract(val, 16, 8)
+            RISCV.mem[idx*4+3] = bit32.extract(val, 24, 8)
+        end,
+        __add = __add
+    })
+    function fficopy(dest, src, size)
+        if type(src) == "string" then
+            for i, c in src:gmatch "()(.)" do
+                dest[i-1] = c:byte()
+            end
+        else
+            for i = 0, size - 1 do
+                dest[i] = src[i]
+            end
+        end
+    end
+    function ffistring(ptr, size)
+        local retval = ""
+        if size then
+            for i = 0, size - 1 do retval = retval .. string.char(ptr[i]) end
+        else
+            for i = 0, math.huge do
+                local c = ptr[i]
+                if c == 0 then break end
+                retval = retval .. string.char(c)
+            end
+        end
+        return retval
+    end
+    canDrawFFI = false
+end
 
 local seek_types = {[0] = "set", "cur", "end"}
 
@@ -114,7 +144,13 @@ local files = {
         write = function(self, data)
             if speaker then
                 local samples = {}
-                for m in data:gmatch "...." do samples[#samples+1] = math.floor(("<h"):unpack(m) / 256) end
+                for i, m in data:gmatch "()(....)" do
+                    local n = math.floor(("<h"):unpack(m) / 256)
+                    samples[i] = n
+                    samples[i+1] = n
+                    samples[i+2] = n
+                    samples[i+3] = n
+                end
                 speaker.playAudio(samples)
             end
         end,
@@ -129,7 +165,7 @@ RISCV.syscalls[0] = function(self, code) -- exit
 end
 
 RISCV.syscalls[1] = function(self, _path, flags) -- open
-    local path = ffi.string(self.mem + _path)
+    local path = ffistring(self.mem + _path)
     if path == "/dev/dsp" then return 3 end
     if bit32.btest(bit32.band(flags, 3), 2) then return -1 end
     local mode = bit32.btest(flags, 1) and (bit32.btest(flags, 8) and "ab" or "wb") or "rb"
@@ -150,12 +186,12 @@ RISCV.syscalls[2] = function(self, fp, _buf, len) -- read
     if not file then return 0 end
     local data = file:read(len)
     if not data then return 0 end
-    ffi.copy(buf, data)
+    fficopy(buf, data)
     return #data
 end
 
 RISCV.syscalls[3] = function(self, fp, _buf, len) -- write
-    local buf = ffi.string(self.mem + _buf, len)
+    local buf = ffistring(self.mem + _buf, len)
     local file = files[fp]
     if not file then return 0 end
     file:write(buf)
@@ -171,8 +207,8 @@ RISCV.syscalls[4] = function(self, fp) -- close
 end
 
 RISCV.syscalls[5] = function(self, _path, _st) -- stat
-    local path = ffi.string(self.mem + _path)
-    local st = ffi.cast()
+    local path = ffistring(self.mem + _path)
+    --local st = ffi.cast()
     return 0xFFFFFFFF
 end
 
@@ -183,7 +219,7 @@ RISCV.syscalls[6] = function(self, _us) -- epoch
 end
 
 RISCV.syscalls[7] = function(self, _path, mode) -- access
-    local path = ffi.string(self.mem + _path)
+    local path = ffistring(self.mem + _path)
     local exists = fs.exists(path)
     local ro = fs.isReadOnly(path)
     local res = (exists and not (bit32.btest(mode, 2) and ro)) and 0 or 0xFFFFFFFF
@@ -220,9 +256,13 @@ RISCV.syscalls[11] = function(self) -- updatePalette
 end
 
 RISCV.syscalls[12] = function(self) -- updateScreen
-    local screen = {}
-    for y = 1, 200 do screen[y] = ffi.string(self.mem + 0x2000000 + (y-1)*320, 320) end
-    term.drawPixels(0, 0, screen)
+    if canDrawFFI then
+        term.drawPixels(0, 0, self.mem + 0x2000000, 320, 200)
+    else
+        local screen = {}
+        for y = 1, 200 do screen[y] = ffistring(self.mem + 0x2000000 + (y-1)*320, 320) end
+        term.drawPixels(0, 0, screen)
+    end
     return 0
 end
 
@@ -678,9 +718,9 @@ local function loadELF(data, mem)
         local type, offset, addr, filesize, memsize, flags, align = ("<IIIxxxxIIII"):unpack(data, progheadpos + (i - 1) * progheadsz + 1)
         if type == 1 then
             print(("offset=%08x address=%08x size=%08x/%08x"):format(offset, addr, filesize, memsize))
-            assert(ffi.sizeof(mem) >= addr + filesize, "not enough space")
+            --assert(ffi.sizeof(mem) >= addr + filesize, "not enough space")
             assert(#data >= offset + filesize, "not enough data")
-            ffi.copy(mem + addr, data:sub(offset + 1), filesize)
+            fficopy(mem + addr, data:sub(offset + 1), filesize)
         end
     end
     return entrypoint
@@ -693,7 +733,7 @@ local pos = 0x200FD04 + #args * 4
 for i, v in ipairs(args) do
     if pos + #v + 1 > 764 then break end
     RISCV.mem32[0x803F40 + i] = pos
-    ffi.copy(RISCV.mem + pos, v)
+    fficopy(RISCV.mem + pos, v)
     pos = pos + #v + 1
 end
 local file = fs.open(shell.resolve("linux/linuxxdoom"), "rb")
@@ -703,7 +743,9 @@ RISCV.pc = loadELF(elf, RISCV.mem)
 RISCV.reg[2] = 0x1FF0000
 local ok, err = xpcall(function()
     while true do
+        --local time = os.epoch "nano"
         RISCV:run(100000)
+        --print(os.epoch "nano" - time)
         if RISCV.halt then break end
         os.queueEvent("__queue_back")
         repeat eventQueue[#eventQueue+1] = {os.pullEvent()}

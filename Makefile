@@ -6,7 +6,7 @@
 #
 CC=  riscv64-elf-gcc -march=rv32im -mabi=ilp32 -I/usr/riscv32-elf/include  # gcc or g++
 
-CFLAGS=-Wno-unused-const-variable -DNORMALUNIX #-DLINUX # -DUSEASM 
+CFLAGS=-Wno-unused-const-variable -DNORMALUNIX -O2 #-DLINUX # -DUSEASM 
 LDFLAGS=-L/usr/riscv32-elf/lib/rv32im/ilp32 -nostdlib -static #-L/usr/X11R6/lib
 LIBS=/usr/riscv32-elf/lib/rv32im/ilp32/crt0.o -lc -lm -lgcc #-lXext -lX11 -lnsl
 
