@@ -6,6 +6,7 @@ for i = 1, 31 do RISCV.reg[i] = 0 end
 setmetatable(RISCV.reg, {__index = function() return 0 end, __newindex = function() end})
 local fficopy, ffistring, canDrawFFI
 if ffi then
+    print("Using FFI acceleration")
     RISCV.mem = ffi.new("uint8_t[?]", 0x2010000)
     RISCV.mem16 = ffi.cast("uint16_t*", RISCV.mem)
     RISCV.mem32 = ffi.cast("uint32_t*", RISCV.mem)
@@ -161,7 +162,7 @@ local files = {
 RISCV.syscalls[0] = function(self, code) -- exit
     --error("fail")
     self.halt = true
-    return 0
+    return code
 end
 
 RISCV.syscalls[1] = function(self, _path, flags) -- open
@@ -266,6 +267,12 @@ RISCV.syscalls[12] = function(self) -- updateScreen
     return 0
 end
 
+-- for tests
+RISCV.syscalls[93] = function(self, code)
+    self.halt = true
+    return code
+end
+
 local eventQueue = {}
 RISCV.syscalls[13] = function(self, _ev) -- getEvent
     while #eventQueue > 0 do
@@ -299,11 +306,6 @@ RISCV.syscalls[13] = function(self, _ev) -- getEvent
         end
     end
     return 0
-end
-
-local function signed(num)
-    if bit32.btest(num, 0x80000000) then return num - 0x100000000 end
-    return num
 end
 
 local function fiximm(bits) return function(inst)
@@ -399,316 +401,412 @@ local opcode_modes = {
     [0x73] = decodeI, -- E*
 }
 
-RISCV.opcodes[0x37] = function(self, inst) -- LUI
-    self.reg[inst.rd] = inst.imm
-    return "LUI x" .. inst.rd .. ", " .. inst.imm
+RISCV.opcodes[0x37] = function(pc, inst) -- LUI
+    return ([[
+        self.reg[%d] = %d
+    ]]):format(inst.rd, inst.imm)
 end
 
-RISCV.opcodes[0x17] = function(self, inst) -- AUIPC
-    self.reg[inst.rd] = (self.pc - 4 + inst.imm) % 0x100000000
-    return "AUIPC x" .. inst.rd .. ", " .. inst.imm
+RISCV.opcodes[0x17] = function(pc, inst) -- AUIPC
+    return ([[
+        self.reg[%d] = %d
+    ]]):format(inst.rd, (pc - 4 + inst.imm) % 0x100000000)
 end
 
-RISCV.opcodes[0x6F] = function(self, inst) -- JAL
-    self.reg[inst.rd] = self.pc
-    self.pc = self.pc + inst.simm - 4
-    if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    return "JAL x" .. inst.rd .. ", " .. inst.simm
+RISCV.opcodes[0x6F] = function(pc, inst) -- JAL
+    if (pc + inst.simm - 4) % 4 ~= 0 then error("unaligned jump to " .. (pc + inst.simm - 4)) end
+    return ([[
+        self.reg[%d] = %d
+        return self.traces[%d](self)
+    ]]):format(inst.rd, pc, pc + inst.simm - 4), true
 end
 
-RISCV.opcodes[0x67] = function(self, inst) -- JALR
-    local oldpc = self.pc
-    self.pc = bit32.band(self.reg[inst.rs1] + inst.simm, 0xFFFFFFFE)
-    self.reg[inst.rd] = oldpc
-    if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    return "JALR x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
+RISCV.opcodes[0x67] = function(pc, inst) -- JALR
+    return ([[
+        local pc = bit32.band(self.reg[%d] + %d, 0xFFFFFFFE)
+        self.reg[%d] = %d
+        return self.traces[pc](self)
+    ]]):format(inst.rs1, inst.simm, inst.rd, pc), true
 end
 
-RISCV.opcodes[0x63][0] = function(self, inst) -- BEQ
-    if self.reg[inst.rs1] == self.reg[inst.rs2] then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
+RISCV.opcodes[0x63][0] = function(pc, inst) -- BEQ
+    return ([[
+        if self.reg[%d] == self.reg[%d] then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][1] = function(pc, inst) -- BNE
+    return ([[
+        if self.reg[%d] ~= self.reg[%d] then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][4] = function(pc, inst) -- BLT
+    return ([[
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        if ra < rb then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][5] = function(pc, inst) -- BGE
+    return ([[
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        if ra >= rb then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][6] = function(pc, inst) -- BLTU
+    return ([[
+        if self.reg[%d] < self.reg[%d] then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x63][7] = function(pc, inst) -- BGEU
+    return ([[
+        if self.reg[%d] >= self.reg[%d] then return self.traces[%d](self)
+        else return self.traces[%d](self) end
+    ]]):format(inst.rs1, inst.rs2, pc + inst.simm - 4, pc), true
+end
+
+RISCV.opcodes[0x03][0] = function(pc, inst) -- LB
+    return ([[
+        self.reg[%d] = self.mem[self.reg[%d] + %d]
+        if self.reg[%d] >= 0x80 then self.reg[%d] = self.reg[%d] + 0xFFFFFF00 end
+    ]]):format(inst.rd, inst.rs1, inst.simm, inst.rd, inst.rd, inst.rd)
+end
+
+RISCV.opcodes[0x03][1] = function(pc, inst) -- LH
+    return ([[
+        local addr = self.reg[%d] + %d
+        if addr %% 2 ~= 0 then self.reg[%d] = self.mem[addr] + self.mem[addr+1] * 256
+        else self.reg[%d] = self.mem16[addr / 2] end
+        if self.reg[%d] >= 0x8000 then self.reg[%d] = self.reg[%d] + 0xFFFF0000 end
+    ]]):format(inst.rs1, inst.simm, inst.rd, inst.rd, inst.rd, inst.rd, inst.rd)
+end
+
+RISCV.opcodes[0x03][2] = function(pc, inst) -- LW
+    return ([[
+        local addr = self.reg[%d] + %d
+        if addr %% 4 ~= 0 then self.reg[%d] = self.mem[addr] + self.mem[addr+1] * 256 + self.mem[addr+2] * 65536 + self.mem[addr+3] * 16777216
+        else self.reg[%d] = self.mem32[addr / 4] end
+    ]]):format(inst.rs1, inst.simm, inst.rd, inst.rd)
+end
+
+RISCV.opcodes[0x03][4] = function(pc, inst) -- LBU
+    return ([[
+        self.reg[%d] = self.mem[self.reg[%d] + %d]
+    ]]):format(inst.rd, inst.rs1, inst.simm)
+end
+
+RISCV.opcodes[0x03][5] = function(pc, inst) -- LHU
+    return ([[
+        local addr = self.reg[%d] + %d
+        if addr %% 2 ~= 0 then self.reg[%d] = self.mem[addr] + self.mem[addr+1] * 256
+        else self.reg[%d] = self.mem16[addr / 2] end
+    ]]):format(inst.rs1, inst.simm, inst.rd, inst.rd)
+end
+
+RISCV.opcodes[0x23][0] = function(pc, inst) -- SB
+    return ([[
+        self.mem[self.reg[%d] + %d] = self.reg[%d] %% 256
+    ]]):format(inst.rs1, inst.simm, inst.rs2)
+end
+
+RISCV.opcodes[0x23][1] = function(pc, inst) -- SH
+    return ([[
+        local addr = self.reg[%d] + %d
+        if addr %% 2 ~= 0 then
+            self.mem[addr] = bit32.extract(self.reg[%d], 0, 8)
+            self.mem[addr+1] = bit32.extract(self.reg[%d], 8, 8)
+        else self.mem16[addr / 2] = self.reg[%d] %% 65536 end
+    ]]):format(inst.rs1, inst.simm, inst.rs2, inst.rs2, inst.rs2)
+end
+
+RISCV.opcodes[0x23][2] = function(pc, inst) -- SW
+    return ([[
+        local addr = self.reg[%d] + %d
+        if addr %% 4 ~= 0 then
+            self.mem[addr] = bit32.extract(self.reg[%d], 0, 8)
+            self.mem[addr+1] = bit32.extract(self.reg[%d], 8, 8)
+            self.mem[addr+2] = bit32.extract(self.reg[%d], 16, 8)
+            self.mem[addr+3] = bit32.extract(self.reg[%d], 24, 8)
+        else self.mem32[addr / 4] = self.reg[%d] end
+    ]]):format(inst.rs1, inst.simm, inst.rs2, inst.rs2, inst.rs2, inst.rs2, inst.rs2)
+end
+
+RISCV.opcodes[0x13][0] = function(pc, inst) -- ADDI
+    if inst.rs1 == 0 then
+        return ([[
+        self.reg[%d] = %d
+        ]]):format(inst.rd, inst.simm % 0x100000000)
+    elseif inst.simm == 0 then
+        return ([[
+        self.reg[%d] = self.reg[%d]
+        ]]):format(inst.rd, inst.rs1)
+    else
+        return ([[
+        self.reg[%d] = (self.reg[%d] + %d) %% 0x100000000
+        ]]):format(inst.rd, inst.rs1, inst.simm)
     end
-    return "BEQ x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
 end
 
-RISCV.opcodes[0x63][1] = function(self, inst) -- BNE
-    if self.reg[inst.rs1] ~= self.reg[inst.rs2] then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BNE x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
+RISCV.opcodes[0x13][2] = function(pc, inst) -- SLTI
+    return ([[
+        local rs = self.reg[%d]
+        if rs >= 0x80000000 then rs = rs - 0x100000000 end
+        self.reg[%d] = rs < %d and 1 or 0
+    ]]):format(inst.rs1, inst.rd, inst.simm)
 end
 
-RISCV.opcodes[0x63][4] = function(self, inst) -- BLT
-    if signed(self.reg[inst.rs1]) < signed(self.reg[inst.rs2]) then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BLT x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x63][5] = function(self, inst) -- BGE
-    if signed(self.reg[inst.rs1]) >= signed(self.reg[inst.rs2]) then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BGE x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x63][6] = function(self, inst) -- BLTU
-    if self.reg[inst.rs1] < self.reg[inst.rs2] then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BLTU x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x63][7] = function(self, inst) -- BGEU
-    if self.reg[inst.rs1] >= self.reg[inst.rs2] then
-        self.pc = self.pc + inst.simm - 4
-        if self.pc % 4 ~= 0 then error("unaligned jump to " .. self.pc) end
-    end
-    return "BGEU x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][0] = function(self, inst) -- LB
-    self.reg[inst.rd] = self.mem[self.reg[inst.rs1] + inst.simm]
-    if bit32.btest(self.reg[inst.rd], 0x80) then self.reg[inst.rd] = bit32.bor(self.reg[inst.rd], 0xFFFFFF00) end
-    return "LB x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][1] = function(self, inst) -- LH
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr % 2 ~= 0 then self.reg[inst.rd] = self.mem[addr] + self.mem[addr+1] * 256
-    else self.reg[inst.rd] = self.mem16[addr / 2] end
-    if bit32.btest(self.reg[inst.rd], 0x8000) then self.reg[inst.rd] = bit32.bor(self.reg[inst.rd], 0xFFFF0000) end
-    return "LH x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][2] = function(self, inst) -- LW
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr % 4 ~= 0 then self.reg[inst.rd] = self.mem[addr] + self.mem[addr+1] * 256 + self.mem[addr+2] * 65536 + self.mem[addr+3] * 16777216
-    else self.reg[inst.rd] = self.mem32[addr / 4] end
-    return "LW x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][4] = function(self, inst) -- LBU
-    self.reg[inst.rd] = self.mem[self.reg[inst.rs1] + inst.simm]
-    return "LBU x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x03][5] = function(self, inst) -- LHU
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr % 2 ~= 0 then self.reg[inst.rd] = self.mem[addr] + self.mem[addr+1] * 256
-    else self.reg[inst.rd] = self.mem16[addr / 2] end
-    return "LHU x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x23][0] = function(self, inst) -- SB
-    self.mem[self.reg[inst.rs1] + inst.simm] = bit32.band(self.reg[inst.rs2], 0xFF)
-    return "SB x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x23][1] = function(self, inst) -- SH
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr % 2 ~= 0 then
-        self.mem[addr] = bit32.extract(self.reg[inst.rs2], 0, 8)
-        self.mem[addr+1] = bit32.extract(self.reg[inst.rs2], 8, 8)
-    else self.mem16[addr / 2] = bit32.band(self.reg[inst.rs2], 0xFFFF) end
-    return "SH x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x23][2] = function(self, inst) -- SW
-    local addr = self.reg[inst.rs1] + inst.simm
-    if addr % 4 ~= 0 then
-        self.mem[addr] = bit32.extract(self.reg[inst.rs2], 0, 8)
-        self.mem[addr+1] = bit32.extract(self.reg[inst.rs2], 8, 8)
-        self.mem[addr+2] = bit32.extract(self.reg[inst.rs2], 16, 8)
-        self.mem[addr+3] = bit32.extract(self.reg[inst.rs2], 24, 8)
-    else self.mem32[addr / 4] = self.reg[inst.rs2] end
-    return "SW x" .. inst.rs1 .. ", x" .. inst.rs2 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x13][0] = function(self, inst) -- ADDI
-    self.reg[inst.rd] = (self.reg[inst.rs1] + inst.simm) % 0x100000000
-    return "ADDI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
-end
-
-RISCV.opcodes[0x13][2] = function(self, inst) -- SLTI
-    self.reg[inst.rd] = signed(self.reg[inst.rs1]) < inst.simm and 1 or 0
-    return "SLTI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.imm
-end
-
-RISCV.opcodes[0x13][3] = function(self, inst) -- SLTIU
+RISCV.opcodes[0x13][3] = function(pc, inst) -- SLTIU
     local imm = inst.simm
     if imm < 0 then imm = imm + 0x100000000 end
-    self.reg[inst.rd] = self.reg[inst.rs1] < imm and 1 or 0
-    return "SLTIU x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.imm
+    return ([[
+        self.reg[%d] = self.reg[%d] < %d and 1 or 0
+    ]]):format(inst.rd, inst.rs1, imm)
 end
 
-RISCV.opcodes[0x13][4] = function(self, inst) -- XORI
-    self.reg[inst.rd] = bit32.bxor(self.reg[inst.rs1], inst.simm)
-    return "XORI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
+RISCV.opcodes[0x13][4] = function(pc, inst) -- XORI
+    return ([[
+        self.reg[%d] = bit32.bxor(self.reg[%d], %d)
+    ]]):format(inst.rd, inst.rs1, inst.simm % 0x100000000)
 end
 
-RISCV.opcodes[0x13][6] = function(self, inst) -- ORI
-    self.reg[inst.rd] = bit32.bor(self.reg[inst.rs1], inst.simm)
-    return "ORI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
+RISCV.opcodes[0x13][6] = function(pc, inst) -- ORI
+    return ([[
+        self.reg[%d] = bit32.bor(self.reg[%d], %d)
+    ]]):format(inst.rd, inst.rs1, inst.simm % 0x100000000)
 end
 
-RISCV.opcodes[0x13][7] = function(self, inst) -- ANDI
-    self.reg[inst.rd] = bit32.band(self.reg[inst.rs1], inst.simm)
-    return "ANDI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.simm
+RISCV.opcodes[0x13][7] = function(pc, inst) -- ANDI
+    return ([[
+        self.reg[%d] = bit32.band(self.reg[%d], %d)
+    ]]):format(inst.rd, inst.rs1, inst.simm % 0x100000000)
 end
 
-RISCV.opcodes[0x13][1] = function(self, inst) -- SLLI
-    self.reg[inst.rd] = bit32.lshift(self.reg[inst.rs1], bit32.band(inst.imm, 0x1F))
-    return "SLLI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.imm
+RISCV.opcodes[0x13][1] = function(pc, inst) -- SLLI
+    return ([[
+        self.reg[%d] = bit32.lshift(self.reg[%d], %d)
+    ]]):format(inst.rd, inst.rs1, bit32.band(inst.imm, 0x1F))
 end
 
-RISCV.opcodes[0x13][5] = function(self, inst) -- SRLI/SRAI
-    self.reg[inst.rd] = (bit32.btest(inst.imm, 0x400) and bit32.arshift or bit32.rshift)(self.reg[inst.rs1], bit32.band(inst.imm, 0x1F))
-    return "SRLI/SRAI x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.imm
+RISCV.opcodes[0x13][5] = function(pc, inst) -- SRLI/SRAI
+    return ([[
+        self.reg[%d] = bit32.%srshift(self.reg[%d], %d)
+    ]]):format(inst.rd, bit32.btest(inst.imm, 0x400) and "a" or "", inst.rs1, bit32.band(inst.imm, 0x1F))
 end
 
-RISCV.opcodes[0x33][0] = function(self, inst) -- ADD/SUB
-    if bit32.btest(inst.funct7, 0x20) then self.reg[inst.rd] = (self.reg[inst.rs1] - self.reg[inst.rs2]) % 0x100000000
-    else self.reg[inst.rd] = (self.reg[inst.rs1] + self.reg[inst.rs2]) % 0x100000000 end
-    return "ADD/SUB x" .. inst.rd .. ", x" .. inst.rs1 .. ", " .. inst.rs2
+RISCV.opcodes[0x33][0] = function(pc, inst) -- ADD/SUB
+    return ([[
+        self.reg[%d] = (self.reg[%d] %s self.reg[%d]) %% 0x100000000
+    ]]):format(inst.rd, inst.rs1, bit32.btest(inst.funct7, 0x20) and "-" or "+", inst.rs2)
 end
 
-RISCV.opcodes[0x33][1] = function(self, inst) -- SLL
-    self.reg[inst.rd] = bit32.lshift(self.reg[inst.rs1], bit32.band(self.reg[inst.rs2], 0x1F))
-    return "SLL x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][1] = function(pc, inst) -- SLL
+    return ([[
+        self.reg[%d] = bit32.lshift(self.reg[%d], bit32.band(self.reg[%d], 0x1F))
+    ]]):format(inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][2] = function(self, inst) -- SLT
-    self.reg[inst.rd] = signed(self.reg[inst.rs1]) < signed(self.reg[inst.rs2]) and 1 or 0
-    return "SLT x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][2] = function(pc, inst) -- SLT
+    return ([[
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        self.reg[%d] = ra < rb and 1 or 0
+    ]]):format(inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.opcodes[0x33][3] = function(self, inst) -- SLTU
-    self.reg[inst.rd] = self.reg[inst.rs1] < self.reg[inst.rs2] and 1 or 0
-    return "SLTU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][3] = function(pc, inst) -- SLTU
+    return ([[
+        self.reg[%d] = self.reg[%d] < self.reg[%d] and 1 or 0
+    ]]):format(inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][4] = function(self, inst) -- XOR
-    self.reg[inst.rd] = bit32.bxor(self.reg[inst.rs1], self.reg[inst.rs2])
-    return "XOR x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][4] = function(pc, inst) -- XOR
+    return ([[
+        self.reg[%d] = bit32.bxor(self.reg[%d], self.reg[%d])
+    ]]):format(inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][5] = function(self, inst) -- SRL/SRA
-    self.reg[inst.rd] = (bit32.btest(inst.funct7, 0x20) and bit32.arshift or bit32.rshift)(self.reg[inst.rs1], bit32.band(self.reg[inst.rs2], 0x1F))
-    return "SRL/SRA x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][5] = function(pc, inst) -- SRL/SRA
+    return ([[
+        self.reg[%d] = bit32.%srshift(self.reg[%d], bit32.band(self.reg[%d], 0x1F))
+    ]]):format(inst.rd, bit32.btest(inst.funct7, 0x20) and "a" or "", inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][6] = function(self, inst) -- OR
-    self.reg[inst.rd] = bit32.bor(self.reg[inst.rs1], self.reg[inst.rs2])
-    return "OR x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][6] = function(pc, inst) -- OR
+    return ([[
+        self.reg[%d] = bit32.bor(self.reg[%d], self.reg[%d])
+    ]]):format(inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x33][7] = function(self, inst) -- AND
-    self.reg[inst.rd] = bit32.band(self.reg[inst.rs1], self.reg[inst.rs2])
-    return "AND x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.opcodes[0x33][7] = function(pc, inst) -- AND
+    return ([[
+        self.reg[%d] = bit32.band(self.reg[%d], self.reg[%d])
+    ]]):format(inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.opcodes[0x0F] = function(self, inst) -- FENCE
+RISCV.opcodes[0x0F] = function(pc, inst) -- FENCE
     -- do nothing
-    return "FENCE"
+    return ""
 end
 
-RISCV.opcodes[0x73] = function(self, inst) -- ECALL/EBREAK
-    if self.syscalls[self.reg[17]] then self.reg[10] = self.syscalls[self.reg[17]](self, table.unpack(self.reg, 10, 16)) end
-    --if self.reg[17] == 93 then self.halt = true end
-    --print("ECALL " .. self.reg[17])
-    return "ECALL " .. self.reg[17]
+RISCV.opcodes[0x73] = function(pc, inst) -- ECALL/EBREAK
+    if inst.funct3 ~= 0 then return "" end -- Zicsr not implemented
+    if inst.imm == 0 then return [=[
+        if self.syscalls[self.reg[17]] then self.reg[10] = self.syscalls[self.reg[17]](self, table.unpack(self.reg, 10, 16)) end
+        if self.halt then return end
+    ]=]
+    elseif inst.imm == 0x302 then return [=[
+        return self.traces[self.reg[5]](self)
+    ]=], true end
 end
 
-RISCV.mult_opcodes[0] = function(self, inst) -- MUL
-    self.reg[inst.rd] = math.abs((signed(self.reg[inst.rs1]) * signed(self.reg[inst.rs2])) % 0x100000000)
-    return "MUL x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[0] = function(pc, inst) -- MUL
+    return ([[
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        self.reg[%d] = math.abs((ra * rb) %% 0x100000000)
+    ]]):format(inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.mult_opcodes[3] = function(self, inst) -- MULHU
-    self.reg[inst.rd] = math.floor((self.reg[inst.rs1] * self.reg[inst.rs2]) / 0x100000000)
-    return "MULH x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[3] = function(pc, inst) -- MULHU
+    return ([[
+        self.reg[%d] = math.floor((self.reg[%d] * self.reg[%d]) / 0x100000000)
+    ]]):format(inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.mult_opcodes[2] = function(self, inst) -- MULHSU
-    self.reg[inst.rd] = math.floor((signed(self.reg[inst.rs1]) * self.reg[inst.rs2]) / 0x100000000)
-    if self.reg[inst.rd] < 0 then self.reg[inst.rd] = self.reg[inst.rd] + 0x100000000 end
-    return "MULHSU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[2] = function(pc, inst) -- MULHSU
+    return ([[
+        local ra = self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        local rd = math.floor((ra * self.reg[%d]) / 0x100000000)
+        if rd < 0 then rd = rd + 0x100000000 end
+        self.reg[%d] = rd
+    ]]):format(inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.mult_opcodes[1] = function(self, inst) -- MULH
-    self.reg[inst.rd] = math.floor((signed(self.reg[inst.rs1]) * signed(self.reg[inst.rs2])) / 0x100000000)
-    if self.reg[inst.rd] < 0 then self.reg[inst.rd] = self.reg[inst.rd] + 0x100000000 end
-    return "MULHU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[1] = function(pc, inst) -- MULH
+    return ([[
+        local ra, rb = self.reg[%d], self.reg[%d]
+        if ra >= 0x80000000 then ra = ra - 0x100000000 end
+        if rb >= 0x80000000 then rb = rb - 0x100000000 end
+        local rd = math.floor((ra * rb) / 0x100000000)
+        if rd < 0 then rd = rd + 0x100000000 end
+        self.reg[%d] = rd
+    ]]):format(inst.rs1, inst.rs2, inst.rd)
 end
 
-RISCV.mult_opcodes[4] = function(self, inst) -- DIV
-    if self.reg[inst.rs2] == 0 then
-        self.reg[inst.rd] = 0xFFFFFFFF
-    else
-        local res = signed(self.reg[inst.rs1]) / signed(self.reg[inst.rs2])
-        if res < 0 then self.reg[inst.rd] = math.ceil(res) + 0x100000000
-        else self.reg[inst.rd] = math.floor(res) end
-    end
-    return "DIV x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[4] = function(pc, inst) -- DIV
+    return ([[
+        if self.reg[%d] == 0 then
+            self.reg[%d] = 0xFFFFFFFF
+        else
+            local ra, rb = self.reg[%d], self.reg[%d]
+            if ra >= 0x80000000 then ra = ra - 0x100000000 end
+            if rb >= 0x80000000 then rb = rb - 0x100000000 end
+            local res = ra / rb
+            if res < 0 then self.reg[%d] = math.ceil(res) + 0x100000000
+            else self.reg[%d] = math.floor(res) end
+        end
+    ]]):format(inst.rs2, inst.rd, inst.rs1, inst.rs2, inst.rd, inst.rd)
 end
 
-RISCV.mult_opcodes[5] = function(self, inst) -- DIVU
-    if self.reg[inst.rs2] == 0 then self.reg[inst.rd] = 0xFFFFFFFF
-    else self.reg[inst.rd] = math.floor(self.reg[inst.rs1] / self.reg[inst.rs2]) end
-    return "DIVU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[5] = function(pc, inst) -- DIVU
+    return ([[
+        if self.reg[%d] == 0 then self.reg[%d] = 0xFFFFFFFF
+        else self.reg[%d] = math.floor(self.reg[%d] / self.reg[%d]) end
+    ]]):format(inst.rs2, inst.rd, inst.rd, inst.rs1, inst.rs2)
 end
 
-RISCV.mult_opcodes[6] = function(self, inst) -- REM
-    if self.reg[inst.rs2] == 0 then
-        self.reg[inst.rd] = self.reg[inst.rs1]
-    else
-        local res = math.fmod(signed(self.reg[inst.rs1]), signed(self.reg[inst.rs2]))
-        if res < 0 then self.reg[inst.rd] = math.ceil(res) + 0x100000000
-        else self.reg[inst.rd] = math.floor(res) end
-    end
-    return "REM x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[6] = function(pc, inst) -- REM
+    return ([[
+        if self.reg[%d] == 0 then
+            self.reg[%d] = self.reg[%d]
+        else
+            local ra, rb = self.reg[%d], self.reg[%d]
+            if ra >= 0x80000000 then ra = ra - 0x100000000 end
+            if rb >= 0x80000000 then rb = rb - 0x100000000 end
+            local res = math.fmod(ra, rb)
+            if res < 0 then self.reg[%d] = math.ceil(res) + 0x100000000
+            else self.reg[%d] = math.floor(res) end
+        end
+    ]]):format(inst.rs2, inst.rd, inst.rs1, inst.rs1, inst.rs2, inst.rd, inst.rd)
 end
 
-RISCV.mult_opcodes[7] = function(self, inst) -- REMU
-    if self.reg[inst.rs2] == 0 then self.reg[inst.rd] = self.reg[inst.rs1]
-    else self.reg[inst.rd] = self.reg[inst.rs1] % self.reg[inst.rs2] end
-    return "REMU x" .. inst.rd .. ", x" .. inst.rs1 .. ", x" .. inst.rs2
+RISCV.mult_opcodes[7] = function(pc, inst) -- REMU
+    return ([[
+        if self.reg[%d] == 0 then self.reg[%d] = self.reg[%d]
+        else self.reg[%d] = self.reg[%d] %% self.reg[%d] end
+    ]]):format(inst.rs2, inst.rd, inst.rs1, inst.rd, inst.rs1, inst.rs2)
 end
 
-function RISCV:clock()
-    if self.pc >= 33554432 then error("pc out of bounds") end
-    local oldpc = self.pc
-    local inst = self.mem32[self.pc / 4]
-    self.pc = self.pc + 4
-    local mode = opcode_modes[bit32.band(inst, 0x7F)]
-    if not mode then
-        error(("Unknown opcode %02X"):format(bit32.band(inst, 0x7F)))
-        return
-    end
-    inst = mode(inst)
-    --print(textutils.serialize(inst))
-    local f = self.opcodes[inst.opcode]
-    local op
-    if type(f) == "function" then op = f(self, inst)
-    elseif type(f) == "table" then
-        if not f[inst.funct3] then print("Unknown function " .. inst.funct3)
-        elseif inst.opcode == 0x33 and bit32.btest(inst.funct7, 1) then op = self.mult_opcodes[inst.funct3](self, inst)
-        else op = f[inst.funct3](self, inst) end
-    else error("Unknown opcode " .. inst.opcode) end
-    --if op then print(("%08x  %s"):format(oldpc, op)) end
-end
+RISCV.traces = setmetatable({}, {__index = function(trace, pc)
+    local self = RISCV
+    local base = pc
+    local chunk = ([[
+    local math, bit32 = math, bit32
+    return function(self)
+        if self.halt then return end
+        self.branches = self.branches + 1
+        if self.branches > self.branchesLimit then coroutine.yield() end
+        self.pc = %d
+    ]]):format(pc)
+    repeat
+        if pc >= 33554432 then error("pc out of bounds") end
+        if pc % 4 ~= 0 then error(("unaligned jump to %08X"):format(pc)) end
+        local inst = self.mem32[pc / 4]
+        if inst == 0xc0001073 then chunk = chunk .. "self.halt = true\n" break end
+        pc = pc + 4
+        local mode = opcode_modes[bit32.band(inst, 0x7F)]
+        if not mode then
+            error(("Unknown opcode %02X at %08X"):format(bit32.band(inst, 0x7F), pc - 4))
+            return
+        end
+        inst = mode(inst)
+        --print(textutils.serialize(inst))
+        local f = self.opcodes[inst.opcode]
+        local op, isBranch
+        if type(f) == "function" then op, isBranch = f(pc, inst)
+        elseif type(f) == "table" then
+            if not f[inst.funct3] then print("Unknown function " .. inst.funct3)
+            elseif inst.opcode == 0x33 and bit32.btest(inst.funct7, 1) then op, isBranch = self.mult_opcodes[inst.funct3](pc, inst)
+            else op, isBranch = f[inst.funct3](pc, inst) end
+        else error("Unknown opcode " .. inst.opcode .. " at " .. (pc - 4)) end
+        chunk = chunk .. op
+    until isBranch
+    chunk = chunk .. "end"
+    --print(chunk)
+    local fn = assert(load(chunk, ("@%08X"):format(base)))()
+    trace[base] = fn
+    return fn
+end})
 
 function RISCV:run(cycles)
-    for i = 1, cycles do if self.halt then return end self:clock() --[[sleep(0.05)]] end
+    self.branches = 0
+    self.branchesLimit = cycles
+    if self.coro then
+        assert(coroutine.resume(self.coro))
+    else
+        self.coro = coroutine.create(self.traces[self.pc])
+        assert(coroutine.resume(self.coro, self))
+    end
+    if coroutine.status(self.coro) == "dead" then self.coro = nil end
 end
 
 local function loadELF(data, mem)
+    RISCV.traces = setmetatable({}, getmetatable(RISCV.traces))
     local magic, b32, le, headerver, abi, type, isa, elfver, entrypoint, progheadpos, sectheadpos, flags, headsize, progheadsz, nproghead, sectheadsz, nsecthead, sectnameidx =
         ("<c4BBBBxxxxxxxxHHIIIIIHHHHHH"):unpack(data)
     if magic ~= "\x7fELF" then error("invalid ELF file") end
@@ -767,16 +865,18 @@ term.setGraphicsMode(0)
 for i = 0, 15 do term.setPaletteColor(2^i, term.nativePaletteColor(2^i)) end
 if not ok then printError(err) end
 --[=[]]
-for _, name in ipairs(fs.list("linuxdoom/tests")) do
+local test = ...
+for _, name in ipairs(fs.list("doom/tests")) do
+    if not test or name == test then
     print(name)
-    local file = fs.open("linuxdoom/tests/" .. name, "rb")
+    local file = fs.open("doom/tests/" .. name, "rb")
     local elf = file.readAll()
     file.close()
     RISCV.halt = false
     RISCV.pc = loadELF(elf, RISCV.mem)
     RISCV.reg[2] = 0x1FF0000
     assert(xpcall(function()
-        RISCV:run(10000)
+        while not RISCV.halt do RISCV:run(10000) end
         if not bit32.btest(RISCV.reg[10], 1) then print(name, "success")
         else error(name .. " failure") end
         --sleep(1)
@@ -790,5 +890,6 @@ for _, name in ipairs(fs.list("linuxdoom/tests")) do
         end
         return msg
     end))
+    end
 end
 --]=]
