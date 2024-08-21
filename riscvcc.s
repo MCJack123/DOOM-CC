@@ -84,6 +84,12 @@ getEvent:
     ecall
     ret
 
+.globl I_GetTime
+I_GetTime:
+    li a7, 14
+    ecall
+    ret
+
 /*.globl FixedMul
 FixedMul:
     mul t0, a0, a1

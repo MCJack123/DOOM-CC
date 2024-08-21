@@ -19,6 +19,8 @@ void I_InitNetwork (void) {
     doomcom->numplayers = doomcom->numnodes = 1;
 	doomcom->deathmatch = false;
 	doomcom->consoleplayer = 0;
+    doomcom->ticdup = 1;
+    doomcom->extratics = 0;
 }
 
 void I_NetCmd (void) {

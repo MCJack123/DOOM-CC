@@ -86,6 +86,7 @@ byte* I_ZoneBase (int*	size)
 // I_GetTime
 // returns time in 1/70th second tics
 //
+/*
 int  I_GetTime (void)
 {
     struct timeval	tp;
@@ -99,6 +100,7 @@ int  I_GetTime (void)
     newtics = (tp.tv_sec-basetime)*TICRATE + tp.tv_usec*TICRATE/1000000;
     return newtics;
 }
+*/
 
 
 

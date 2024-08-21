@@ -116,6 +116,7 @@ local keymap = {
     [keys.enter] = 13,
     [keys.tab] = 9,
     [keys.backspace] = 127,
+    [keys.leftCtrl] = 157,
     [keys.rightShift] = 0x80+0x36,
     [keys.rightCtrl] = 0x80+0x1d,
     [keys.rightAlt] = 0x80+0x38,
@@ -267,12 +268,6 @@ RISCV.syscalls[12] = function(self) -- updateScreen
     return 0
 end
 
--- for tests
-RISCV.syscalls[93] = function(self, code)
-    self.halt = true
-    return code
-end
-
 local eventQueue = {}
 RISCV.syscalls[13] = function(self, _ev) -- getEvent
     while #eventQueue > 0 do
@@ -285,7 +280,7 @@ RISCV.syscalls[13] = function(self, _ev) -- getEvent
             self.mem[_ev] = 1
             self.mem[_ev+1] = keymap[ev[2]] or ev[2]
             return 1
-        elseif ev[1] == "mouse_down" then
+        --[[elseif ev[1] == "mouse_down" then
             self.mem[_ev] = 2
             self.mem[_ev+1] = ev[2]
             self.mem16[_ev / 2 + 1] = ev[3]
@@ -302,10 +297,20 @@ RISCV.syscalls[13] = function(self, _ev) -- getEvent
             self.mem[_ev+1] = 0
             self.mem16[_ev / 2 + 1] = ev[3] or 0
             self.mem16[_ev / 2 + 2] = ev[4] or 0
-            return 1
+            return 1]]
         end
     end
     return 0
+end
+
+RISCV.syscalls[14] = function(self) -- getTick
+    return math.floor((os.epoch "utc" / 1000) * 70) % 0x100000000
+end
+
+-- for tests
+RISCV.syscalls[93] = function(self, code)
+    self.halt = true
+    return code
 end
 
 local function fiximm(bits) return function(inst)
