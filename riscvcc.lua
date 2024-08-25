@@ -240,7 +240,7 @@ RISCV.syscalls[9] = function(self, fp, offset, whence) -- seek
     return file:seek(seek_types[whence], offset) or 0xFFFFFFFF
 end
 
-if term.setGraphicsMode and false then
+if term.setGraphicsMode then
     RISCV.syscalls[10] = function(self, mode) -- setGraphicsMode
         term.setGraphicsMode(mode)
         if mode == 2 then term.clear() end
