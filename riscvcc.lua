@@ -240,32 +240,144 @@ RISCV.syscalls[9] = function(self, fp, offset, whence) -- seek
     return file:seek(seek_types[whence], offset) or 0xFFFFFFFF
 end
 
-RISCV.syscalls[10] = function(self, mode) -- setGraphicsMode
-    term.setGraphicsMode(mode)
-    if mode == 2 then term.clear() end
-    return 0
-end
-
-RISCV.syscalls[11] = function(self) -- updatePalette
-    for i = 0, 255 do
-        term.setPaletteColor(i,
-            self.mem[0x200FA00 + i*3] / 255,
-            self.mem[0x200FA00 + i*3 + 1] / 255,
-            self.mem[0x200FA00 + i*3 + 2] / 255
-        )
+if term.setGraphicsMode and false then
+    RISCV.syscalls[10] = function(self, mode) -- setGraphicsMode
+        term.setGraphicsMode(mode)
+        if mode == 2 then term.clear() end
+        return 0
     end
-    return 0
-end
 
-RISCV.syscalls[12] = function(self) -- updateScreen
-    if canDrawFFI then
-        term.drawPixels(0, 0, self.mem + 0x2000000, 320, 200)
-    else
-        local screen = {}
-        for y = 1, 200 do screen[y] = ffistring(self.mem + 0x2000000 + (y-1)*320, 320) end
-        term.drawPixels(0, 0, screen)
+    RISCV.syscalls[11] = function(self) -- updatePalette
+        for i = 0, 255 do
+            term.setPaletteColor(i,
+                self.mem[0x200FA00 + i*3] / 255,
+                self.mem[0x200FA00 + i*3 + 1] / 255,
+                self.mem[0x200FA00 + i*3 + 2] / 255
+            )
+        end
+        return 0
     end
-    return 0
+
+    RISCV.syscalls[12] = function(self) -- updateScreen
+        if canDrawFFI then
+            term.drawPixels(0, 0, self.mem + 0x2000000, 320, 200)
+        else
+            local screen = {}
+            for y = 1, 200 do screen[y] = ffistring(self.mem + 0x2000000 + (y-1)*320, 320) end
+            term.drawPixels(0, 0, screen)
+        end
+        return 0
+    end
+else
+    local term = peripheral.find("monitor") or term.current()
+    if term.setTextScale then term.setTextScale(0.5) end
+    local pixelbox = require "pixelbox_lite".new(term)
+    local palette, paletteColors = {}, {}
+    for i = 0, 255 do palette[i], paletteColors[i] = colors.black, 0 end
+
+    local function medianCut(pal, num)
+        if num == 1 then
+            local sum = {r = 0, g = 0, b = 0}
+            for _,v in ipairs(pal) do sum.r, sum.g, sum.b = sum.r + v[1], sum.g + v[2], sum.b + v[3] end
+            return {{math.floor(sum.r / #pal), math.floor(sum.g / #pal), math.floor(sum.b / #pal)}}
+        else
+            local red, green, blue = {min = 255, max = 0}, {min = 255, max = 0}, {min = 255, max = 0}
+            for _,v in ipairs(pal) do
+                local r, g, b = v[1], v[2], v[3]
+                red.min, red.max = math.min(r, red.min), math.max(r, red.max)
+                green.min, green.max = math.min(g, green.min), math.max(g, green.max)
+                blue.min, blue.max = math.min(b, blue.min), math.max(b, blue.max)
+            end
+            local ranges = {red.max - red.min, green.max - green.min, blue.max - blue.min}
+            local maxComponent
+            if ranges[1] > ranges[2] and ranges[1] > ranges[3] then maxComponent = 1
+            elseif ranges[2] > ranges[3] and ranges[2] > ranges[1] then maxComponent = 2
+            else maxComponent = 3 end
+            table.sort(pal, function(a, b) return a[maxComponent] < b[maxComponent] end)
+            local a, b = {}, {}
+            for i,v in ipairs(pal) do
+                if i < #pal / 2 then a[i] = v
+                else b[i - math.floor(#pal / 2)] = v end
+            end
+            local ar, br = medianCut(a, num / 2), medianCut(b, num / 2)
+            for _,v in ipairs(br) do ar[#ar+1] = v end
+            return ar
+        end
+    end
+
+    local function nearestColor(palette, color)
+        local nearest = {dist = math.huge}
+        for i,v in ipairs(palette) do
+            local dist = math.sqrt((v[1] - color[1])^2 + (v[2] - color[2])^2 + (v[3] - color[3])^2)
+            if dist < nearest.dist then nearest = {n = i, dist = dist} end
+        end
+        return nearest.n
+    end
+
+    RISCV.syscalls[10] = function(self, mode) -- setGraphicsMode
+        term.clear()
+        return 0
+    end
+
+    RISCV.syscalls[11] = function(self) -- updatePalette
+        local coltab = {}
+        for i = 0, 255 do
+            local color = {
+                self.mem[0x200FA00 + i*3],
+                self.mem[0x200FA00 + i*3 + 1],
+                self.mem[0x200FA00 + i*3 + 2]
+            }
+            paletteColors[i] = color
+            coltab[i+1] = color
+        end
+        local centers = medianCut(coltab, 16)
+        local buckets = {}
+        -- loop
+        for _ = 1, 100 do
+            local changed = false
+            for i = 1, 16 do buckets[i] = {} end
+            -- place all colors in nearest bucket
+            for i = 0, 255 do
+                local closest = nearestColor(centers, paletteColors[i])
+                buckets[closest][#buckets[closest]+1] = paletteColors[i]
+            end
+            -- generate new centroids
+            local newColors = {}
+            for i = 1, 16 do
+                local sum = {0, 0, 0}
+                local count = 0
+                for _, v in ipairs(buckets[i]) do
+                    sum[1] = sum[1] + v[1]
+                    sum[2] = sum[2] + v[2]
+                    sum[3] = sum[3] + v[3]
+                    count = count + 1
+                end
+                newColors[i] = {math.floor(sum[1] / count + 0.5), math.floor(sum[2] / count + 0.5), math.floor(sum[3] / count + 0.5)}
+                if newColors[i][1] ~= centers[i][1] or newColors[i][2] ~= centers[i][2] or newColors[i][3] ~= centers[i][3] then changed = true end
+            end
+            centers = newColors
+            if not changed then break end
+        end
+        for i = 1, 16 do term.setPaletteColor(2^(i-1), centers[i][1] / 255, centers[i][2] / 255, centers[i][3] / 255) end
+        for i = 0, 255 do
+            palette[i] = 2^(nearestColor(centers, paletteColors[i])-1)
+        end
+        return 0
+    end
+
+    RISCV.syscalls[12] = function(self) -- updateScreen
+        local screen = setmetatable({}, {__index = function() return setmetatable({}, {__index = function() return 32768 end}) end})
+        for y = 1, 200 do
+            local row = setmetatable({}, {__index = function() return 32768 end})
+            screen[y] = row
+            for x = 1, 320 do
+                row[x] = palette[self.mem[0x1FFFFFF + (y-1)*320 + x]]
+            end
+        end
+        pixelbox.CANVAS = screen
+        pixelbox:render()
+        return 0
+    end
 end
 
 local eventQueue = {}
@@ -866,7 +978,7 @@ end, function(msg)
     end
     return msg
 end)
-term.setGraphicsMode(0)
+if term.setGraphicsMode then term.setGraphicsMode(0) end
 for i = 0, 15 do term.setPaletteColor(2^i, term.nativePaletteColor(2^i)) end
 if not ok then printError(err) end
 --[=[]]
